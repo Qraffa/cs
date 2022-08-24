@@ -481,3 +481,65 @@ repl_backlog_buffer = second * write_size_per_seond
 
 ## 哨兵
 
+### 哨兵主要功能
+
+Redis哨兵是运行在特殊模式下的Redis服务器，主要用于监控各Redis服务器的状态，以及执行故障转移，主从切换等工作，来保证Redis的高可用性。
+
+哨兵机制主要有以下功能：
+
+- 监控：哨兵持续检查master和replica是否正常运行
+- 通知：当监控中的Redis实例出现错误时，可以通知给其他进程
+- 自动故障转移：当master出现故障时，哨兵启动故障转移，选举合适的replica成为新的master，并且调整其他的replica与新的master同步；并且通知客户端使用新的master地址进行连接
+
+### 哨兵实现机制
+
+哨兵与各Redis服务器通过建立命令连接以及订阅连接来通信。
+
+哨兵首先会与master建立命令连接和订阅连接，然后与master通信，使用`info`命令获取master的replica，然后与这些replica同样建立命令连接和订阅连接。
+
+在哨兵集群中，哨兵通过master的订阅频道发现了其他哨兵后，会与该哨兵建立命令连接，最终将整个哨兵集群连接起来。
+
+### 故障转移
+
+#### master下线
+
+哨兵会每秒一次向其他Redis实例发送`PING`命令，以检查连接情况。如果实例在一定时间内，没有正常响应PING命令，则该哨兵会认为该实例已经是**主观下线（SDOWN）**，该时间有参数`down-after-milliseconds`控制。
+
+当master被哨兵认为是SDOWN后，该哨兵需要进一步向其他哨兵确认，确认该master是否真的已经下线了。当一定数量的哨兵都确认该master已经下线后，该master由主观下线变更为**客观下线（ODOWN）**。只有master实例由ODOWN状态。
+
+#### 哨兵Leader
+
+当master被认为客观下线后，与该master建立了监控连接的哨兵会进行协商，选举出一个哨兵Leader，由该哨兵来进行故障转移的操作。
+
+**选举Leader：**
+
+- 每个发现master进入客观下线状态的哨兵都会成为候选者，并向其他哨兵发送命令，期望将自己设置为Leader
+
+- 候选者会将票投给自己
+- 在一次选举epoch中，一个哨兵只会投票一次，采用先到先得的原则
+- 当候选者的票数满足以下情况后，该哨兵成为Leader
+  - 获得哨兵集群中过半的票数
+  - 获得的票数要大于等于该master配置的quorum的数量
+
+#### 执行故障转移
+
+当选举出Leader后，该Leader执行故障转移，包含以下几个过程：
+
+1. 从该master的replica中选举新的master
+2. 将原master的replica改为复制新的master
+3. 将原master设置为新master的replica
+4. 通知客户端，新master的变更信息
+
+**选举新Leader：**
+
+1. 首先将已经下线的replica去掉，保证选的是正常在线的
+2. 将与原master断开超过`down-after-milliseconds * 10 ms`的replica去掉，保证选的replica网络良好，并且数据比较新
+3. 根据replica的优先级、写入偏移量、runID选出新的Leader
+
+**修改replica的复制目标**
+
+向其他replica发送`slaveof`命令，让这些replica成为新master的从节点
+
+**修改原master**
+
+修改哨兵中记录的原master的相关信息，并且等原master上线后，向其发送`slaveof`命令，让其成为新master的从节点
